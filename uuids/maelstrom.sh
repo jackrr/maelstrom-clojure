@@ -2,4 +2,5 @@
 
 set -eo pipefail
 
-../maelstrom/maelstrom test -w uuid --bin uuids.clj --time-limit 5
+../maelstrom/maelstrom test -w unique-ids --bin uuids.clj --time-limit 5
+

@@ -56,12 +56,15 @@
 
 (def node-id (atom ""))
 (def next-message-id (atom 0))
+(def id-idx (atom 0))
 
+(defn gen-uuid []
+  (str @node-id (swap! id-idx inc)))
 
 (defn- process-request
   [input]
   (let [body (:body input)
-        r-body {:msg_id (swap! next-message-id inc)
+        reply-body {:msg_id (swap! next-message-id inc)
                 :in_reply_to (:msg_id body)}]
     (case (:type body)
       "init"
@@ -69,17 +72,22 @@
         (reset! node-id (:node_id body))
         (reply @node-id
                (:src input)
-               (assoc r-body :type "init_ok")))
+               (assoc reply-body :type "init_ok")))
+      "generate"
+      (reply @node-id
+             (:src input)
+             (assoc reply-body
+                    :id (gen-uuid)
+                    :type "generate_ok"))
       "echo"
       (reply @node-id
              (:src input)
-             (assoc r-body
+             (assoc reply-body
                     :type "echo_ok"
                     :echo (:echo body))))))
 
-;; TODO: do uuids now!
 (defn -main
-  "Read transactions from stdin and send output to stdout"
+  "It's a server"
   []
   (process-stdin (comp printout
                        generate-json
