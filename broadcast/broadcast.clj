@@ -1,10 +1,18 @@
 #!/usr/bin/env bb
 
-(ns maelstrom-clojure.uuids
+(ns maelstrom-clojure.broadcast
   (:gen-class)
   (:require
-    [cheshire.core :as json]))
+   [cheshire.core :as json]
+   [clojure.core.async :as async]))
 
+(def children (atom []))
+(def ledger (atom {}))
+
+(def node-id (atom ""))
+(def next-message-id (atom 0))
+(def id-idx (atom 0))
+(def unacked (atom {}))
 
 ;;;;;;;;;;;;;;;;;;; Util functions ;;;;;;;;;;;;;;;;;;;
 
@@ -41,31 +49,16 @@
   (binding [*out* *err*]
     (println input)))
 
-
 (defn- printout
   "Print the received input to stdout"
   [input]
   (when input
     (println input)))
 
-(def children (atom []))
-(def ledger (atom []))
-
-(def node-id (atom ""))
-(def next-message-id (atom 0))
-(def id-idx (atom 0))
-
 (defn gen-uuid []
-  (str @node-id (swap! id-idx inc)))
-
-(defn reply
-  [input body]
-  {:src @node-id
-   :dest (:src input)
-   :body body})
+  (str @node-id "-" (swap! id-idx inc)))
 
 (defn send
-  "Send a message out of request/response cycle"
   [target-node-id body]
   (-> {:src @node-id
        :dest target-node-id
@@ -73,47 +66,47 @@
       generate-json
       printout))
 
-(defn send-replicate
-  "Send replicate message and record that we are awaiting ack"
-  [peer-id body]
-  (send peer-id body))
-
-;; TODO: periodically flush unacked
-(def unacked (atom {}))
-
 (def flush-interval-ms 10)
 (defn flush-unacked
   "Infinite loop -- sleep 10 ms and resend all in unacked"
   []
   (while true
-    (printerr "Flushing acks")
-    (if (< 0 (count unacked))
-      (doseq [{peer-id :peer-id payload :payload} (vals unacked)]
-        (send peer-id payload))
-      (printerr (str "No unacks: " unacked)))
-    (Thread/sleep flush-interval-ms)))
+    (when (< 0 (count @unacked))
+      (doseq [p (vals @unacked)]
+        (send (:peer p) (:payload p))))
+    (Thread/sleep (long flush-interval-ms))))
+
+(defn unacked-key
+  [peer nonce]
+  (str peer nonce))
+
+(defn ack
+  "Handle replication ack message"
+  [peer nonce]
+  (swap! unacked #(dissoc % (unacked-key peer nonce))))
 
 (defn record-and-propagate
   "Record broadcast message and distribute to peers that haven't seen it"
   [val seen nonce]
-  (swap! ledger #(conj % val))
-  (doseq [peer-id (clojure.set/difference @children (set seen))]
+  (swap! ledger #(assoc % nonce val)) ;; use nonce as key to prevent dupes
+  (doseq [peer (clojure.set/difference @children (set seen))]
     (let [payload {:type "replicate"
                    :val val
                    :nonce nonce 
                    :seen (conj seen @node-id)}]
       (swap! unacked #(assoc %
-                             (str peer-id nonce)
+                             (unacked-key peer nonce)
                              {:payload payload
-                                :peer peer-id}))
-      (send peer-id payload))))
+                              :peer peer}))
+      (send peer payload))))
 
 (defn- process-request
   [input]
   (let [body (:body input)
+        src (:src input)
         reply-body {:msg_id (swap! next-message-id inc)
                     :in_reply_to (:msg_id body)}
-        reply (partial reply input)]
+        reply (partial send src)]
     (case (:type body)
       "init"
       (do
@@ -129,37 +122,36 @@
       "replicate"
       ;; Accept a broadcast replication as a secondary
       (do
-        (record-and-propagate (:val body) (:seen body) (:nonce body))
-        (reply (assoc reply-body :type "replicate_ok")))
+        (let [nonce (:nonce body)]
+          (record-and-propagate (:val body) (:seen body) nonce)
+          (reply (assoc reply-body
+                        :type "replicate_ok"
+                        :nonce nonce))))
 
       "replicate_ok"
       ;; Clear message from unacked
       (do
-        (swap! unacked #(dissoc % (str (:src body) (:nonce body))))
-        (printerr "Received ack"))
+        (ack (:src input) (:nonce body))
+        nil)
 
       "read"
       (reply (assoc reply-body
                     :type "read_ok"
-                    :messages @ledger))
+                    :messages (vals @ledger)))
       
       "topology"
       (do
         (reset! children (set (get-in body [:topology (keyword @node-id)])))
-        (printerr @children)
         (reply (assoc reply-body
                       :type "topology_ok"))))))
 
 (defn -main
   "It's a server"
   []
-  (let [flusher (future (flush-unacked))]
-    (process-stdin (comp printout
-                         generate-json
-                         process-request
-                         parse-json))
-    (printerr "CANCELLING AHHHHH!!!!!!!!!!")
-    (future-cancel flusher)))
-
+  (async/go (flush-unacked))
+  (process-stdin (comp printout
+                       generate-json
+                       process-request
+                       parse-json)))
 
 (-main)
